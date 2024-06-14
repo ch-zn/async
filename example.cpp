@@ -1,5 +1,8 @@
-#include "async.hpp"
 #include <iostream>
+#include "async.hpp"
+#include <unistd.h>
+#include <thread>
+
 using namespace chzn;
 using namespace std;
 
@@ -16,9 +19,18 @@ int main(){
                 c+='A'-'a';
         co_return str;
     };
-    [&]()->async<void>{
+    auto delayStr=[&]()->async<std::string>{
+        auto str=co_await getUpperStr();
+        co_return co_await do_task<std::string>([=](auto&ret){
+        std::thread([=,&ret](){
+            usleep(1000000);
+            ret.return_value(str+" delayed");
+        }).detach();
+        });
+    };
+    [&]()->async<>{
         while(1){
-            auto str=co_await getUpperStr();
+            auto str=co_await delayStr();
             cout<<str<<endl;
         }
     }();
@@ -33,5 +45,4 @@ int main(){
             return 0;
         }
     }
-
 }
