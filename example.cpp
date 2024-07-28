@@ -19,7 +19,7 @@ int main(){
     bool echoing=true;
     [&]()->async<void>{// echo uppercased string
         for(string str=co_await getUpperStr();echoing;str=co_await getUpperStr())
-        cout<<str<<endl;
+            cout<<str<<endl;
     }();
     [&]()->async<void>{// when cin "chzn" stop scanning
         co_await readChzn();
@@ -38,13 +38,13 @@ int main(){
     void *userptr=nullptr;
     [&]()->async<void>{
         cout<< co_await do_async<string>(
-            [&](chzn::co_returner<string>&r){
-                callback=[](string str,void*ptr){
-                    ((chzn::co_returner<string>*)ptr)->return_value(str);
-                };
-                userptr=&r;
-            }
-    );
+                [&](chzn::co_returner<string>&r){
+                    callback=[](string str,void*ptr){
+                        ((chzn::co_returner<string>*)ptr)->return_value(str);
+                    };
+                    userptr=&r;
+                }
+        );
         cout<<endl;
     }();
 
@@ -58,9 +58,8 @@ int main(){
     }();
     auto t=[&]()->task{
         for(string str=co_await readStr;;str=co_await readStr)
-        cout<<str<<endl;
+            cout<<str<<endl;
     }();
-    t.run();
     while(scanning){
         string str;
         cin>>str;

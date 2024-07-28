@@ -27,11 +27,11 @@
 
 #include <coroutine>
 #include <exception>
-#include <forward_list>
 #include <any>
+#include <functional>
 
 /*
- * version 1.0 Everything Move Only
+ * version 1.0.0 Everything Move Only
  * 2024/6/15
  * type:
  * - chzn::async<T>
@@ -74,6 +74,11 @@
  *     resume coroutine co_awaiting this, it will get the value t;
  *   - return_void()     requires T==void
  *     resume coroutine co_awaiting this;
+ *
+ * version 1.0.1
+ * 2024/7/28
+ * changes:
+ * - chzn::notifier now use custom list, because handle std::list::iterator only is not enough to erase element;
  * */
 namespace chzn{
     template<typename T>
@@ -397,21 +402,65 @@ namespace chzn{
                 coroutine.resume();
             }
         };
+
+        template<typename T>
+        struct _notifier_slot_list{
+            struct node{
+                node *last,*next;notifier_slot<T> value;
+                // stl::list don't contain this, because it preserve size;
+                void erase(){
+                    last->next=next;
+                    next->last=last;
+                    delete this;
+                }
+            };
+            struct iterator{
+                node *n;
+                notifier_slot<T>& operator*(){return n->value;}
+                void operator++(){n=n->next;}
+                bool operator==(iterator b)const noexcept{return n==b.n;}
+            };
+            node *the_end;
+
+            _notifier_slot_list():the_end(new node){the_end->last=the_end->next=the_end;}
+            iterator begin(){return {the_end->next};}
+            iterator end(){return {the_end};}
+            notifier_slot<T>& push(){
+                auto new_node=new node{the_end->last,the_end,{}};
+                the_end->last->next=new_node;
+                the_end->last=new_node;
+                return new_node->value;
+            }
+            node* last_push(){
+                return the_end->last;
+            }
+            ~_notifier_slot_list(){
+                for(auto it=the_end->next,nit=it->next;it!=the_end;it=nit,nit=it->next){
+                    delete it;
+                }
+                delete the_end;
+            }
+            _notifier_slot_list(_notifier_slot_list&)=delete;
+        };
+
+        template<typename T>
+        void swap(_notifier_slot_list<T>&a,_notifier_slot_list<T>&b){
+            std::swap(a.the_end,b.the_end);
+        }
     }
 
     template<typename T>
     struct notifier{
         // list keep reference
-        std::forward_list<_detail::notifier_slot<T>> listener;
+        _detail::_notifier_slot_list<T> listener;
         _detail::notifier_slot<T> &operator
         co_await (){
-            listener.push_front({});
-            return listener.front();
+            return listener.push();
         }
 
         void notify(T &t){
             decltype(listener) old;
-            std::swap(old,listener);
+            swap(old,listener);
             for(auto &a:old)
                 a.notify(t);
         }
@@ -429,28 +478,27 @@ namespace chzn{
 
         notifier(notifier &) = delete;
 
-        notifier(notifier &&n) noexcept{std::swap(listener,n.listener);}
+        notifier(notifier &&n) noexcept{swap(listener,n.listener);}
 
         void operator=(notifier &) = delete;
 
         notifier &operator=(notifier &&t) noexcept{
-            std::swap(listener,t.listener);
+            swap(listener,t.listener);
             return *this;
         }
     };
 
     template<>
     struct notifier<void>{
-        std::forward_list<_detail::notifier_slot<void>> listener;
+        _detail::_notifier_slot_list<void> listener;
         _detail::notifier_slot<void> &operator
         co_await (){
-            listener.push_front({});
-            return listener.front();
+            return listener.push();
         }
 
         void notify(){
             decltype(listener) old;
-            std::swap(old,listener);
+            swap(old,listener);
             for(auto &a:old)
                 a.notify();
         }
@@ -464,12 +512,12 @@ namespace chzn{
 
         notifier(notifier &) = delete;
 
-        notifier(notifier &&n) noexcept{std::swap(listener,n.listener);}
+        notifier(notifier &&n) noexcept{swap(listener,n.listener);}
 
         void operator=(notifier &) = delete;
 
         notifier &operator=(notifier &&n) noexcept{
-            std::swap(listener,n.listener);
+            swap(listener,n.listener);
             return *this;
         }
     };
@@ -531,20 +579,23 @@ namespace chzn{
 }
 
 /*
- * version 2.0 Cancelable Task
+ * version 1.1.0 Cancelable Task
  * 2024/7/26
  * type:
  * - chzn::task
  *   usage:
  *   - cancel() to cancel cancelable coroutine;
  *   - not co_awaitable;
- *   - run() to start;
  *   - move only;
  *   member function:
  *   - cancel()
  *     cancel cancelable coroutine;
- *   - run()
- *     start the coroutine;
+ *
+ * version 1.1.1
+ * 2024/7/28
+ * changes:
+ * - task is no longer lazy start, because it can't be co_awaited;
+ * - task co_await notifier needn't create proxy layer;
  * */
 namespace chzn{
     struct task;
@@ -638,10 +689,13 @@ namespace chzn{
 
             ))>::type;
         };
+
     }
     struct task{
         struct promise_type:public async<void>::promise_type{
             task get_return_object(){return {handle_type::from_promise(*this)};}
+
+            constexpr std::suspend_never initial_suspend()const noexcept{return {};}
 
             struct suspend_final:public std::suspend_always{
                 std::coroutine_handle<> await_suspend(
@@ -650,12 +704,22 @@ namespace chzn{
 
             constexpr suspend_final final_suspend() const noexcept{return {};}
 
-            std::coroutine_handle<> *cancel_token=nullptr;
+            void(*cancel_func)(void*)=nullptr;
+            void* cancel_token=nullptr;
 
             template<typename U>
             auto await_transform(U &&u){
                 auto t=_detail::_task_transformed_async<typename _detail::_co_await_T<U>::type>::transform(u);
                 cancel_token=&t.coroutine.promise().await_by;
+                cancel_func=[](void *token){*(std::coroutine_handle<>*)token=std::noop_coroutine();};
+                return t;
+            }
+
+            template<typename U>
+            auto& await_transform(notifier<U> &u){
+                auto &t=u.operator co_await();
+                cancel_token=u.listener.last_push();
+                cancel_func=[](void *token){((decltype(u.listener.last_push()))token)->erase();};
                 return t;
             }
         };
@@ -664,13 +728,10 @@ namespace chzn{
         handle_type coroutine;
 
         void cancel(){
-            auto t=coroutine.promise().cancel_token;
+            auto &t=coroutine.promise().cancel_func;
             if(!t)[[unlikely]]return;
-            *t=std::noop_coroutine();
-        }
-
-        void run(){
-            coroutine.resume();
+            t(coroutine.promise().cancel_token);
+            t=nullptr;
         }
 
         ~task(){
