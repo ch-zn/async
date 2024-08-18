@@ -115,6 +115,12 @@ namespace chzn{
                     co_await promise;
                 }catch(awaiting_notifier_destructed){}
             }
+
+            template<typename T>
+            static void take(T promise){
+                auto &await_by=promise.coroutine.promise().await_by;
+                await_by=[](T)->unowned_promise{co_await std::suspend_always{};}(std::move(promise)).coroutine;
+            }
         };
     }
 
@@ -295,8 +301,8 @@ namespace chzn{
 
         template<typename U>
         struct _awaiter_operator_helper{
-            static _awaiter_operator<std::invoke_result_t<decltype(&U::await_resume),const U &>> &func(){
-                static _awaiter_operator<std::invoke_result_t<decltype(&U::await_resume),const U &>> op={
+            static _awaiter_operator<std::invoke_result_t<decltype(&U::await_resume),U &>> &func(){
+                static _awaiter_operator<std::invoke_result_t<decltype(&U::await_resume),U &>> op={
                         .ready=[](std::any &self){
                             return std::any_cast<U &>(self).await_ready();
                         },
@@ -596,14 +602,24 @@ namespace chzn{
  * changes:
  * - task is no longer lazy start, because it can't be co_awaited;
  * - task co_await notifier needn't create proxy layer;
+ *
+ * version 1.1.2
+ * 2024/8/17
+ * changes:
+ * - a running task (not suspended, still in stack) no longer cancelable
+ *   try to cancel it will throw chzn::cancel_running_task_error
+ *   if you want cancel task in itself, use:
+ *       co_await [&](this auto)->chzn::async<void>{co_return task.cancel();}();
+ *       (use 'deducing this' to avoid dangling reference 'this' of lambda)
  * */
+#include <stdexcept>
 namespace chzn{
     struct task;
     namespace _detail{
-        template<typename T>
+        template<typename T,bool keep>
         struct _task_transformed_async{
             struct promise_type:public async<T>::promise_type{
-                _task_transformed_async<T> get_return_object(){return {handle_type::from_promise(*this)};}
+                _task_transformed_async<T,keep> get_return_object(){return {handle_type::from_promise(*this)};}
 
                 struct suspend_final:public std::suspend_always{
                     std::coroutine_handle<> await_suspend(
@@ -611,6 +627,10 @@ namespace chzn{
                 };
 
                 constexpr suspend_final final_suspend() const noexcept{return {};}
+
+                template<typename U>
+                promise_type(U &u,void(*&cancel_func_ref)(void*)){cancel_func_ptr=&cancel_func_ref;}
+                void(**cancel_func_ptr)(void*);
             };
 
             using handle_type=std::coroutine_handle<promise_type>;
@@ -629,7 +649,7 @@ namespace chzn{
                 T await_resume() const{
                     if(coroutine.promise().state==_detail::throws)
                         std::rethrow_exception(coroutine.promise().error);
-                    return std::move(reinterpret_cast<T &>(coroutine.promise().value));
+                    if constexpr(!std::is_same_v<T,void>)return std::move(reinterpret_cast<T &>(coroutine.promise().value));
                 }
             };
 
@@ -642,7 +662,14 @@ namespace chzn{
 
             void operator=(_task_transformed_async) = delete;
 
-            ~_task_transformed_async(){if(coroutine)coroutine.destroy();}
+            ~_task_transformed_async(){
+                if(coroutine){
+                    if(coroutine.done()&&coroutine.promise().cancel_func_ptr)
+                        *coroutine.promise().cancel_func_ptr=nullptr;
+                    if(!keep||coroutine.done())coroutine.destroy();
+                    else _detail::unowned_promise::take(std::move(*this));
+                }
+            }
 
         private:
             _task_transformed_async(handle_type handle):coroutine(handle){}
@@ -651,7 +678,12 @@ namespace chzn{
             friend task;
 
             template<typename U>
-            static _task_transformed_async<T> transform(U &u){
+            static _task_transformed_async<T,keep> transform(U u,void(*&cancel_func)(void*)){
+                co_return co_await u;
+            }
+
+            template<typename U>
+            static _task_transformed_async<T,keep> transform(_detail::notifier_slot<U> &u,void(*&cancel_func)(void*)){
                 co_return co_await u;
             }
         };
@@ -690,38 +722,39 @@ namespace chzn{
             ))>::type;
         };
 
+        inline void noop_cancel_func(void*){}
     }
+    struct cancel_running_task_error:std::runtime_error{
+        cancel_running_task_error():std::runtime_error("chzn::task be canceled when running (in stack, not suspend)"){}
+    };
     struct task{
         struct promise_type:public async<void>::promise_type{
             task get_return_object(){return {handle_type::from_promise(*this)};}
 
             constexpr std::suspend_never initial_suspend()const noexcept{return {};}
 
-            struct suspend_final:public std::suspend_always{
-                std::coroutine_handle<> await_suspend(
-                        std::coroutine_handle<promise_type> handle) const noexcept{return handle.promise().await_by;}
-            };
-
-            constexpr suspend_final final_suspend() const noexcept{return {};}
+            constexpr std::suspend_always final_suspend() const noexcept{return {};}
 
             void(*cancel_func)(void*)=nullptr;
             void* cancel_token=nullptr;
 
             template<typename U>
             auto await_transform(U &&u){
-                auto t=_detail::_task_transformed_async<typename _detail::_co_await_T<U>::type>::transform(u);
-                cancel_token=&t.coroutine.promise().await_by;
-                cancel_func=[](void *token){*(std::coroutine_handle<>*)token=std::noop_coroutine();};
+                auto t=_detail::_task_transformed_async<typename _detail::_co_await_T<U>::type,true>::transform(std::forward<U>(u),cancel_func);
+                cancel_token=&t.coroutine.promise();
+                cancel_func=[](void *token){(decltype(&t.coroutine.promise())(token))->await_by=std::noop_coroutine();(decltype(&t.coroutine.promise())(token))->cancel_func_ptr=nullptr;};
                 return t;
             }
 
             template<typename U>
-            auto& await_transform(notifier<U> &u){
+            auto await_transform(notifier<U> &u){
                 auto &t=u.operator co_await();
                 cancel_token=u.listener.last_push();
                 cancel_func=[](void *token){((decltype(u.listener.last_push()))token)->erase();};
-                return t;
+                return _detail::_task_transformed_async<typename _detail::_co_await_T<decltype(t)>::type,false>::transform(t,cancel_func);
             }
+
+            std::suspend_always await_transform(std::suspend_always){cancel_func=_detail::noop_cancel_func;return {};}
         };
 
         using handle_type=std::coroutine_handle<promise_type>;
@@ -729,9 +762,9 @@ namespace chzn{
 
         void cancel(){
             auto &t=coroutine.promise().cancel_func;
-            if(!t)[[unlikely]]return;
+            if(!t)[[unlikely]]throw cancel_running_task_error();
             t(coroutine.promise().cancel_token);
-            t=nullptr;
+            t=_detail::noop_cancel_func;
         }
 
         ~task(){
